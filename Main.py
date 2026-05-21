@@ -118,7 +118,7 @@ def cambiar_estado_limpieza(id_habitacion: str, nuevo_estado: str = Body(..., em
 # 2. RECURSO: RESERVACIONES
 @app.post("/api/v1/reservaciones", status_code=201)
 def crear_reservacion(res: ReservacionInput) -> dict:
-    # Verificar que la habitación exista y esté disponible
+    # 1. Verificar que la habitación exista y esté disponible
     cursor.execute("SELECT estado FROM habitaciones WHERE id_habitacion=?", (res.id_habitacion,))
     habitacion = cursor.fetchone()
     
@@ -127,19 +127,36 @@ def crear_reservacion(res: ReservacionInput) -> dict:
     if habitacion["estado"] == "Ocupada":
         raise HTTPException(status_code=400, detail="La habitación ya se encuentra ocupada")
         
-    res_id = f"RS-{uuid.uuid4().hex[:4].upper()}"
+    # --- NUEVA LÓGICA DE CÓDIGO MEMORABLE ---
+    # Tomamos la primera palabra del nombre del huésped y la ponemos en mayúsculas
+    primer_nombre = res.huesped.split()[0].upper()
     
-    # Inserción de la reservación
-    cursor.execute(
-        "INSERT INTO reservaciones (id_reservacion, id_habitacion, huesped, fecha_inicio, fecha_fin, total_estancia, estado_pago) VALUES (?, ?, ?, ?, ?, ?, ?)",
-        (res_id, res.id_habitacion, res.huesped, res.fecha_inicio, res.fecha_fin, res.total_estancia, "Pendiente")
-    )
+    # Extraemos solo el número de la habitación (quitando el "HAB-")
+    numero_hab = res.id_habitacion.replace("HAB-", "")
+    
+    # Creamos el nuevo ID fácil de recordar (Ejemplo: JUAN-101)
+    res_id = f"{primer_nombre}-{numero_hab}"
+    # ----------------------------------------
+    
+    try:
+        # Inserción de la reservación
+        cursor.execute(
+            "INSERT INTO reservaciones (id_reservacion, id_habitacion, huesped, fecha_inicio, fecha_fin, total_estancia, estado_pago) VALUES (?, ?, ?, ?, ?, ?, ?)",
+            (res_id, res.id_habitacion, res.huesped, res.fecha_inicio, res.fecha_fin, res.total_estancia, "Pendiente")
+        )
+    except sqlite3.IntegrityError:
+        # Si por alguna razón el código ya existe (mismo nombre y misma habitación)
+        raise HTTPException(status_code=400, detail=f"El código {res_id} ya está en uso. Intenta agregar un apellido.")
     
     # Actualizar la habitación a ocupada
     cursor.execute("UPDATE habitaciones SET estado='Ocupada' WHERE id_habitacion=?", (res.id_habitacion,))
     conn.commit()
     
-    return {"estado": "exito", "datos": {"id_reservacion": res_id}, "mensaje": "Reservación creada y habitación ocupada."}
+    return {
+        "estado": "exito", 
+        "datos": {"id_reservacion": res_id}, 
+        "mensaje": f"Reservación creada. El código del huésped es: {res_id}"
+    }
 
 @app.get("/api/v1/reservaciones/{id_reservacion}")
 def obtener_reservacion(id_reservacion: str) -> dict:
