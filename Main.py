@@ -1,6 +1,7 @@
 from fastapi import FastAPI, HTTPException, Body
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
+from datetime import datetime
 import sqlite3
 import uuid
 
@@ -118,8 +119,8 @@ def cambiar_estado_limpieza(id_habitacion: str, nuevo_estado: str = Body(..., em
 # 2. RECURSO: RESERVACIONES
 @app.post("/api/v1/reservaciones", status_code=201)
 def crear_reservacion(res: ReservacionInput) -> dict:
-    # 1. Verificar que la habitación exista y esté disponible
-    cursor.execute("SELECT estado FROM habitaciones WHERE id_habitacion=?", (res.id_habitacion,))
+    # 1. Obtener el estado y el precio real de la habitación desde la base de datos
+    cursor.execute("SELECT estado, precio_noche FROM habitaciones WHERE id_habitacion=?", (res.id_habitacion,))
     habitacion = cursor.fetchone()
     
     if not habitacion:
@@ -127,35 +128,50 @@ def crear_reservacion(res: ReservacionInput) -> dict:
     if habitacion["estado"] == "Ocupada":
         raise HTTPException(status_code=400, detail="La habitación ya se encuentra ocupada")
         
-    # --- NUEVA LÓGICA DE CÓDIGO MEMORABLE ---
-    # Tomamos la primera palabra del nombre del huésped y la ponemos en mayúsculas
-    primer_nombre = res.huesped.split()[0].upper()
-    
-    # Extraemos solo el número de la habitación (quitando el "HAB-")
-    numero_hab = res.id_habitacion.replace("HAB-", "")
-    
-    # Creamos el nuevo ID fácil de recordar (Ejemplo: JUAN-101)
-    res_id = f"{primer_nombre}-{numero_hab}"
+    # --- 2. CÁLCULO AUTOMÁTICO DEL TOTAL ---
+    formato_fecha = "%Y-%m-%d"
+    try:
+        inicio = datetime.strptime(res.fecha_inicio, formato_fecha)
+        fin = datetime.strptime(res.fecha_fin, formato_fecha)
+        dias_estancia = (fin - inicio).days
+        
+        # Si reservan para salir el mismo día, cobramos al menos 1 noche
+        if dias_estancia <= 0:
+            raise HTTPException(status_code=400, detail="La fecha de fin debe ser posterior a la fecha de inicio")
+            
+    except ValueError:
+        raise HTTPException(status_code=400, detail="Formato de fecha inválido. Usa YYYY-MM-DD")
+        
+    # Multiplicamos los días por el costo real de esa habitación
+    total_calculado = dias_estancia * habitacion["precio_noche"]
     # ----------------------------------------
     
+    # 3. Generar el código memorable (ej. JUAN-101)
+    primer_nombre = res.huesped.split()[0].upper()
+    numero_hab = res.id_habitacion.replace("HAB-", "")
+    res_id = f"{primer_nombre}-{numero_hab}"
+    
     try:
-        # Inserción de la reservación
+        # Insertamos usando el 'total_calculado' en lugar del valor que envía la app
         cursor.execute(
             "INSERT INTO reservaciones (id_reservacion, id_habitacion, huesped, fecha_inicio, fecha_fin, total_estancia, estado_pago) VALUES (?, ?, ?, ?, ?, ?, ?)",
-            (res_id, res.id_habitacion, res.huesped, res.fecha_inicio, res.fecha_fin, res.total_estancia, "Pendiente")
+            (res_id, res.id_habitacion, res.huesped, res.fecha_inicio, res.fecha_fin, total_calculado, "Pendiente")
         )
     except sqlite3.IntegrityError:
-        # Si por alguna razón el código ya existe (mismo nombre y misma habitación)
-        raise HTTPException(status_code=400, detail=f"El código {res_id} ya está en uso. Intenta agregar un apellido.")
+        raise HTTPException(status_code=400, detail=f"El código {res_id} ya está en uso. Agrega un apellido.")
     
-    # Actualizar la habitación a ocupada
+    # 4. Actualizar la habitación a ocupada
     cursor.execute("UPDATE habitaciones SET estado='Ocupada' WHERE id_habitacion=?", (res.id_habitacion,))
     conn.commit()
     
     return {
         "estado": "exito", 
-        "datos": {"id_reservacion": res_id}, 
-        "mensaje": f"Reservación creada. El código del huésped es: {res_id}"
+        "datos": {
+            "id_reservacion": res_id, 
+            "dias": dias_estancia, 
+            "total_pagar": total_calculado
+        }, 
+        "mensaje": f"Reservación creada. Total a pagar: ${total_calculado}"
     }
 
 @app.get("/api/v1/reservaciones/{id_reservacion}")
@@ -171,3 +187,28 @@ def obtener_reservacion(id_reservacion: str) -> dict:
 if __name__ == "__main__":
     import uvicorn
     uvicorn.run(app, host="127.0.0.1", port=8000)
+    
+@app.post("/api/v1/habitaciones/{id_habitacion}/desocupar")
+def desocupar_habitacion(id_habitacion: str) -> dict:
+    # 1. Verificar que la habitación exista y esté ocupada
+    cursor.execute("SELECT estado FROM habitaciones WHERE id_habitacion=?", (id_habitacion,))
+    habitacion = cursor.fetchone()
+    
+    if not habitacion:
+        raise HTTPException(status_code=404, detail="La habitación no existe")
+    
+    if habitacion["estado"] != "Ocupada":
+        raise HTTPException(status_code=400, detail="La habitación no está ocupada, no se puede desocupar")
+        
+    # 2. Eliminar la reservación asociada a esta habitación
+    cursor.execute("DELETE FROM reservaciones WHERE id_habitacion=?", (id_habitacion,))
+    
+    # 3. Cambiar el estado de la habitación a 'Limpia'
+    cursor.execute("UPDATE habitaciones SET estado='Limpia' WHERE id_habitacion=?", (id_habitacion,))
+    
+    conn.commit()
+    
+    return {
+        "estado": "exito",
+        "mensaje": f"Check-out exitoso. La habitación {id_habitacion} está limpia y la reservación fue eliminada."
+    }
